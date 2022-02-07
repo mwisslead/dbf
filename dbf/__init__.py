@@ -350,7 +350,7 @@ SYSTEM = NULLABLE = BINARY = NOCPTRANS = None
 SPACE = ASTERISK = TYPE = CR = NULL = None
 START = LENGTH = END = DECIMALS = FLAGS = CLASS = EMPTY = NUL = None
 IN_MEMORY = ON_DISK = CLOSED = READ_ONLY = READ_WRITE = None
-_NULLFLAG = CHAR = CURRENCY = DATE = DATETIME = DOUBLE = FLOAT = TIMESTAMP = None
+_NULLFLAG = CHAR = VARCHAR = VARBINARY = BLOB = CURRENCY = DATE = DATETIME = DOUBLE = FLOAT = None
 GENERAL = INTEGER = LOGICAL = MEMO = NUMERIC = PICTURE = None
 
 class HexEnum(IntEnum):
@@ -614,6 +614,9 @@ class FieldType(IntEnum):
                 )
     _NULLFLAG = b'0'
     CHAR = b'C'
+    VARCHAR = b'V'
+    VARBINARY = b'Q'
+    BLOB = b'W'
     CURRENCY = b'Y'
     DATE = b'D'
     DATETIME = b'T'
@@ -654,7 +657,7 @@ class FieldFlag(IntFlag):
 
 @export(module)
 class Field(AutoEnum):
-    __order__ = 'TYPE START LENGTH END DECIMALS FLAGS CLASS EMPTY NUL'
+    __order__ = 'TYPE START LENGTH END DECIMALS FLAGS CLASS EMPTY NUL VAR'
     TYPE = "Char, Date, Logical, etc."
     START = "Field offset in record"
     LENGTH = "Length of field in record"
@@ -664,6 +667,7 @@ class Field(AutoEnum):
     CLASS = "python class type"
     EMPTY = "python function for empty field"
     NUL = "python function for null field"
+    VAR = "python function for variable field"
 
 @export(module)
 class DbfLocation(AutoEnum):
@@ -3355,7 +3359,20 @@ class Record(object):
                 print(null_def)
                 print(null_data)
                 raise
-        record_data = self._data[fielddef[START]:fielddef[END]]
+        if fielddef[VAR] is not False and '_NULLFLAGS' in self._meta:
+            index = fielddef[VAR]
+            byte, bit = divmod(index, 8)
+            null_def = self._meta['_NULLFLAGS']
+            var_data = self._data[null_def[START]:null_def[END]]
+            isvariable = var_data[byte] >> bit & 1
+            if isvariable:
+                end = fielddef[END]
+                end = fielddef[START] + self._data[fielddef[END] - 1]
+            else:
+                end = fielddef[END]
+            record_data = self._data[fielddef[START]:end]
+        else:
+            record_data = self._data[fielddef[START]:fielddef[END]]
         field_type = fielddef[TYPE]
         retrieve = self._meta.fieldtypes[field_type]['Retrieve']
         datum = retrieve(record_data, fielddef, self._meta.memo, self._meta.decoder)
@@ -3416,6 +3433,16 @@ class Record(object):
             start = fielddef[START]
             end = start + size
             blank[:len(bytes)] = bytes[:]
+            if fielddef[VAR] is not False and '_NULLFLAGS' in self._meta:
+                index = fielddef[VAR]
+                byte, bit = divmod(index, 8)
+                null_def = self._meta['_NULLFLAGS']
+                null_data = self._data[null_def[START]:null_def[END]]
+                if len(bytes) < size:
+                    null_data[byte] |= 1 << bit
+                    blank[-1] = len(bytes)
+                else:
+                    null_data[byte] &= 0xff ^ 1 << bit
             self._data[start:end] = blank[:]
         self._dirty = True
 
@@ -4368,6 +4395,7 @@ def update_numeric(value, fielddef, *ignore):
             raise DataOverflowError('Value representation too long for field')
     return ("%*.*f" % (fielddef[LENGTH], fielddef[DECIMALS], value)).encode('ascii')
 
+
 def retrieve_vfp_datetime(bytes, fielddef, *ignore):
     """
     returns the date/time stored in bytes; dates <= 01/01/1981 00:00:00
@@ -4938,6 +4966,7 @@ class Table(_Navigation):
     _memo_types = (MEMO, )
     _numeric_types = (NUMERIC, FLOAT)            # fields representing a number
     _variable_types = (CHAR, NUMERIC, FLOAT)      # variable length in table
+    _actual_variable_types = ()
     _dbfTableHeader = array('B', [0] * 32)
     _dbfTableHeader[0] = 0              # table type - none
     _dbfTableHeader[8:10] = array('B', pack_short_int(33))
@@ -5262,6 +5291,8 @@ class Table(_Navigation):
             fieldblock.extend(fielddef)
             if layout[TYPE] in meta.memo_types:
                 memo = True
+            if layout[TYPE] in meta.actual_variable_types:
+                nulls += 1
             if layout[FLAGS] & NULLABLE:
                 nulls += 1
         if memo:
@@ -5499,6 +5530,7 @@ class Table(_Navigation):
         meta.fieldtypes = fieldtypes = self._field_types
         meta.fixed_types = self._fixed_types
         meta.variable_types = self._variable_types
+        meta.actual_variable_types = self._actual_variable_types
         meta.character_types = self._character_types
         meta.currency_types = self._currency_types
         meta.decimal_types = self._decimal_types
@@ -5549,7 +5581,7 @@ class Table(_Navigation):
                 matches = glob(filename)
             else:
                 meta.filename = filename + '.dbf'
-                search_name = filename + '.[Db][Bb][Ff]'
+                search_name = filename + '.[Dd][Bb][Ff]'
                 matches = glob(search_name)
                 if not matches:
                     meta.filename = filename
@@ -6465,6 +6497,7 @@ class Db3Table(Table):
     _memo_types = (MEMO, )
     _numeric_types = (NUMERIC, FLOAT)
     _variable_types = (CHAR, NUMERIC, FLOAT)
+    _actual_variable_types = ()
     _dbfTableHeader = array('B', [0] * 32)
     _dbfTableHeader[0] = 3         # version - dBase III w/o memo's
     _dbfTableHeader[8:10] = array('B', pack_short_int(33))
@@ -6611,6 +6644,7 @@ class ClpTable(Db3Table):
     _memo_types = (MEMO, )
     _numeric_types = (NUMERIC, FLOAT)
     _variable_types = (CHAR, NUMERIC, FLOAT)
+    _actual_variable_types = ()
     _dbfTableHeader = array('B', [0] * 32)
     _dbfTableHeader[0] = 3          # version - dBase III w/o memo's
     _dbfTableHeader[8:10] = array('B', pack_short_int(33))
@@ -6879,6 +6913,7 @@ class FpTable(Table):
     _numeric_types = (FLOAT, NUMERIC)
     _text_types = (CHAR, MEMO)
     _variable_types = (CHAR, FLOAT, NUMERIC)
+    _actual_variable_types = ()
     _supported_tables = (0x02, 0x03, 0xf5)
     _dbfTableHeader = array('B', [0] * 32)
     _dbfTableHeader[0] = 0x02          # version - Foxbase
@@ -7002,6 +7037,18 @@ class VfpTable(FpTable):
                     'Type':'Character', 'Retrieve':retrieve_character, 'Update':update_character, 'Blank':lambda x: b' ' * x, 'Init':add_vfp_character,
                     'Class':unicode, 'Empty':unicode, 'flags':('BINARY', 'NOCPTRANS', 'NULL', ),
                     },
+            VARCHAR: {
+                    'Type':'Varchar', 'Retrieve':retrieve_character, 'Update':update_character, 'Blank':lambda x: b' ' * x, 'Init': add_vfp_character,
+                    'Class':unicode, 'Empty':unicode, 'flags':('BINARY', 'NOCPTRANS', 'NULL', ),
+                    },
+            VARBINARY: {
+                    'Type':'Varbinary', 'Retrieve':retrieve_character, 'Update':update_character, 'Blank':lambda x: b' ' * x, 'Init': add_vfp_character,
+                    'Class':bytes, 'Empty':bytes, 'flags':('BINARY', 'NOCPTRANS', 'NULL', ),
+                    },
+            BLOB: {
+                    'Type':'General', 'Retrieve':retrieve_vfp_memo, 'Update':update_vfp_memo, 'Blank':lambda x: b'\x00\x00\x00\x00', 'Init':add_vfp_binary_memo,
+                    'Class':bytes, 'Empty':bytes, 'flags':('NULL', 'BINARY'),
+                    },
             CURRENCY: {
                     'Type':'Currency', 'Retrieve':retrieve_currency, 'Update':update_currency, 'Blank':lambda x: b'\x00' * 8, 'Init':add_vfp_currency,
                     'Class':Decimal, 'Empty':none, 'flags':('NULL', 'BINARY'),
@@ -7065,11 +7112,12 @@ class VfpTable(FpTable):
     # _fixed_types = ('B', 'D', 'G', 'I', 'L', 'M', 'P', 'T', 'Y')
     _fixed_types = (DOUBLE, DATE, GENERAL, INTEGER, LOGICAL, MEMO, PICTURE, DATETIME, CURRENCY)
     _logical_types = (LOGICAL, )
-    _memo_types = (GENERAL, MEMO, PICTURE)
+    _memo_types = (GENERAL, MEMO, PICTURE, BLOB)
     # _numeric_types = ('B', 'F', 'I', 'N', 'Y')
     _numeric_types = (DOUBLE, FLOAT, INTEGER, NUMERIC, CURRENCY)
     _variable_types = (CHAR, FLOAT, NUMERIC)
-    _supported_tables = (0x30, 0x31)
+    _actual_variable_types = (VARCHAR, VARBINARY)
+    _supported_tables = (0x30, 0x31, 0x32)
     _dbfTableHeader = array('B', [0] * 32)
     _dbfTableHeader[0] = 0x30          # version - Foxpro 6  0011 0000
     _dbfTableHeader[8:10] = array('B', pack_short_int(33 + 263))
@@ -7092,6 +7140,7 @@ class VfpTable(FpTable):
         offset = 1
         fieldsdef = meta.header.fields
         nulls_found = False
+        variables_found = False
         total_length = meta.header.record_length
         for i in range(meta.header.field_count):
             fieldblock = fieldsdef[i*32:(i+1)*32]
@@ -7108,6 +7157,9 @@ class VfpTable(FpTable):
             null = flags & NULLABLE
             if null:
                 nulls_found = True
+            variable = type in meta.actual_variable_types
+            if variable:
+                variables_found = True
             if name in meta.fields:
                 raise BadDataError('Duplicate field name found: %s' % name)
             meta.fields.append(name)
@@ -7126,16 +7178,21 @@ class VfpTable(FpTable):
                     flags,
                     cls,
                     empty,
-                    null
+                    null,
+                    variable
                     )
         if offset != total_length:
             raise BadDataError("Header shows record length of %d, but calculated record length is %d" % (total_length, offset))
-        if nulls_found:
-            nullable_fields = [f for f in meta if meta[f][NUL]]
-            nullable_fields.sort(key=lambda f: meta[f][START])
-            for i, f in enumerate(nullable_fields):
-                meta[f] = meta[f][:-1] + (i, )
-            null_bytes, plus_one = divmod(len(nullable_fields), 8)
+        system_field_bits = 0
+        for f in sorted(meta, key=lambda f: meta[f][START]):
+            if meta[f][VAR]:
+                meta[f] = meta[f][:VAR] + (system_field_bits,) + meta[f][VAR + 1:]
+                system_field_bits += 1
+            if meta[f][NUL]:
+                meta[f] = meta[f][:NUL] + (system_field_bits,) + meta[f][NUL + 1:]
+                system_field_bits += 1
+        if system_field_bits:
+            null_bytes, plus_one = divmod(system_field_bits, 8)
             if plus_one:
                 null_bytes += 1
             meta.empty_null = array('B', b'\x00' * null_bytes)
